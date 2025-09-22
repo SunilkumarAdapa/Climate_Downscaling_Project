@@ -9,3 +9,10 @@ __pycache__/
 
 # System files
 .DS_Store
+
+# plots 
+/plots/
+/results/
+/reports/
+/tables/
+
