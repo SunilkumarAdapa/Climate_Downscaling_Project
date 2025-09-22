@@ -5,7 +5,7 @@
 __pycache__/
 
 # Ignore a venv environment folder if one is ever created
-.venv/
+/climate_downscaling/
 
 # System files
 .DS_Store
