@@ -1,78 +1,105 @@
 import xarray as xr
-from xsdba.adjustment import EmpiricalQuantileMapping
 import os
-from glob import glob
+import glob
+import re
+from xsdba.adjustment import EmpiricalQuantileMapping
 
-# ----------------------------
-# CONFIGURATION
-# ----------------------------
+# --- CONFIGURATION: UPDATE YOUR FOLDER PATHS BELOW ---
 
-BASE_DIR = r"C:\Users\ADAPA SUNIL KUMAR\Climate_Downscaling_Project\data\temperature_Gcm_data"
+# 1. Directory Setup
+# Paste the FULL PATH to the folder containing your yearly IMD files
+INPUT_DIR_OBSERVED = r"C:\Users\ADAPA SUNIL KUMAR\Climate_Downscaling_Project\data\temperature_Gcm_data\observed_data"
+# Paste the FULL PATH to the folder containing all your GCM subfolders
+INPUT_DIR_GCM_BASE = r"C:\Users\ADAPA SUNIL KUMAR\Climate_Downscaling_Project\data\temperature_Gcm_data\observed_data\IMD_AVERAGE_TEMP_0.25"
+OUTPUT_DIR_BASE = r"C:\Users\ADAPA SUNIL KUMAR\Climate_Downscaling_Project\data\processed\bias_corrected\INM-CM4-8"
 
-# Observed data (IMD)
-OBS_DIR = os.path.join(BASE_DIR, "observed_data/IMD_AVERAGE_TEMP_0.25")
-OBS_PATTERN = "obs_tas_*.nc"  # adjust if needed
+# 2. File and NetCDF Variable Naming (Set based on your data info)
+OBSERVED_FILE_PATTERN = "IMD_*_avg_temp_0.25.nc" 
+GCM_FILE_PATTERN = "*.nc"
+TIME_VAR = "time"          # Based on your data info
+OBS_DATA_VAR = "avg_temp"  # Based on your observed data info
+GCM_DATA_VAR = "data"      # Based on your GCM data info
 
-# GCM data
-GCM_DIR = os.path.join(BASE_DIR, "INM-CM4-8_YEARLY-TEMP-DATA")
-GCM_HIST_PATTERN = "INM-CM4-8_*1975-2000*.nc"   # historical period
-GCM_FUT_PATTERN  = "INM-CM4-8_*2001-2014*.nc"   # future period
+# 3. Time Periods for analysis
+TRAINING_START_DATE = "1975-01-01"
+TRAINING_END_DATE = "2000-12-31"
+APPLICATION_START_DATE = "2001-01-01"
+APPLICATION_END_DATE = "2014-12-31"
 
-OUTPUT_DIR = os.path.join(BASE_DIR, "bias_corrected")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# --- END OF CONFIGURATION ---
 
-VAR_NAME = "tas"  # variable name in NetCDF files (tasmax/tasmin/tas)
 
-# ----------------------------
-# HELPER FUNCTION: Merge yearly files
-# ----------------------------
-def merge_yearly_files(folder_pattern, var_name):
-    """Merge multiple yearly NetCDF files into a single DataArray."""
-    files = sorted(glob(os.path.join(folder_pattern)))
-    if not files:
-        raise FileNotFoundError(f"No files found for pattern: {folder_pattern}")
-    ds = xr.open_mfdataset(files, combine='by_coords')
-    return ds[var_name]
+def main():
+    """Main script to run the bias correction process for all GCMs."""
+    os.makedirs(OUTPUT_DIR_BASE, exist_ok=True)
 
-# ----------------------------
-# LOAD OBSERVED DATA (1975-2000)
-# ----------------------------
-print("Merging observed files (1975-2000)...")
-obs = merge_yearly_files(os.path.join(OBS_DIR, OBS_PATTERN), VAR_NAME)
-print(f"  -> Observed data shape: {obs.shape}")
+    print("Step 1: Loading and preparing observed data...")
+    obs_filepath_pattern = os.path.join(INPUT_DIR_OBSERVED, OBSERVED_FILE_PATTERN)
+    try:
+        obs_ds = xr.open_mfdataset(obs_filepath_pattern, combine='by_coords')
+        obs_da = obs_ds[OBS_DATA_VAR]
+        obs_da.attrs['units'] = 'degC' 
+        obs_train = obs_da.sel({TIME_VAR: slice(TRAINING_START_DATE, TRAINING_END_DATE)}).load()
+        print(" -> Observed data loaded successfully.")
+    except Exception as e:
+        print(f"FATAL: Could not load observed data. Check path and pattern.")
+        print(f" -> Path tried: {obs_filepath_pattern}")
+        print(f" -> Error details: {e}")
+        return
 
-# ----------------------------
-# MERGE GCM HISTORICAL AND FUTURE DATA
-# ----------------------------
-print("Merging GCM historical (1975-2000)...")
-gcm_hist = merge_yearly_files(os.path.join(GCM_DIR, GCM_HIST_PATTERN), VAR_NAME)
-print(f"  -> GCM historical shape: {gcm_hist.shape}")
+    gcm_folders = [f.path for f in os.scandir(INPUT_DIR_GCM_BASE) if f.is_dir()]
+    if not gcm_folders:
+        print(f"FATAL: No GCM subfolders found in '{INPUT_DIR_GCM_BASE}'. Please check the path.")
+        return
 
-print("Merging GCM future (2001-2014)...")
-gcm_fut = merge_yearly_files(os.path.join(GCM_DIR, GCM_FUT_PATTERN), VAR_NAME)
-print(f"  -> GCM future shape: {gcm_fut.shape}")
+    print(f"\nStep 2: Found {len(gcm_folders)} GCM(s) to process.")
+    
+    for gcm_folder_path in gcm_folders:
+        gcm_name = os.path.basename(gcm_folder_path)
+        print(f"\n--- Processing GCM: {gcm_name} ---")
 
-# ----------------------------
-# BIAS CORRECTION
-# ----------------------------
-print("\nTraining Empirical Quantile Mapping...")
-eqm = EmpiricalQuantileMapping.train(gcm_hist, obs)
+        gcm_output_dir = os.path.join(OUTPUT_DIR_BASE, gcm_name)
+        os.makedirs(gcm_output_dir, exist_ok=True)
 
-print("Adjusting historical data...")
-hist_bc = eqm.adjust(gcm_hist)
+        try:
+            gcm_pattern = os.path.join(gcm_folder_path, GCM_FILE_PATTERN)
+            gcm_ds = xr.open_mfdataset(gcm_pattern, combine='by_coords')
+            gcm_da = gcm_ds[GCM_DATA_VAR]
+            gcm_da.attrs['units'] = 'degC'
 
-print("Adjusting future data...")
-fut_bc = eqm.adjust(gcm_fut)
+            # --- Handle Coordinate Mismatches ---
+            # Rename GCM coordinates to match Observed data for consistency
+            rename_dict = {}
+            if 'lat' in gcm_da.coords and 'LATITUDE' in obs_da.coords:
+                rename_dict['lat'] = 'LATITUDE'
+            if 'lon' in gcm_da.coords and 'LONGITUDE' in obs_da.coords:
+                rename_dict['lon'] = 'LONGITUDE'
+            if rename_dict:
+                print(f"  -> Harmonizing coordinate names: {rename_dict}")
+                gcm_da = gcm_da.rename(rename_dict)
+            # ------------------------------------
 
-# ----------------------------
-# SAVE OUTPUT
-# ----------------------------
-hist_outfile = os.path.join(OUTPUT_DIR, "INM-CM4-8_hist_bias_corrected.nc")
-fut_outfile  = os.path.join(OUTPUT_DIR, "INM-CM4-8_future_bias_corrected.nc")
+            gcm_train = gcm_da.sel({TIME_VAR: slice(TRAINING_START_DATE, TRAINING_END_DATE)}).load()
+            gcm_apply = gcm_da.sel({TIME_VAR: slice(APPLICATION_START_DATE, APPLICATION_END_DATE)})
 
-hist_bc.to_netcdf(hist_outfile)
-fut_bc.to_netcdf(fut_outfile)
+            if gcm_apply.time.size == 0:
+                print("  -> WARNING: No data in application period. Skipping.")
+                continue
 
-print(f"\nSaved bias-corrected historical: {hist_outfile}")
-print(f"Saved bias-corrected future: {fut_outfile}")
-print("\nBias correction completed successfully!")
+            # Apply Empirical Quantile Mapping
+            print("  -> Training EQM model and applying correction...")
+            eqm = EmpiricalQuantileMapping.train(gcm_train, obs_train)
+            corrected_eqm = eqm.adjust(gcm_apply)
+            
+            output_eqm_path = os.path.join(gcm_output_dir, f"{gcm_name}_EQM_corrected.nc")
+            corrected_eqm.to_netcdf(output_eqm_path)
+            print(f"  -> Saved: {os.path.basename(output_eqm_path)}")
+
+        except Exception as e:
+            print(f"  -> ERROR: Failed to process {gcm_name}. Skipping. Reason: {e}")
+            continue
+
+    print("\n✅ All GCMs processed successfully!")
+
+if __name__ == "__main__":
+    main()
